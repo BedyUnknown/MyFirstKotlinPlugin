@@ -1,131 +1,87 @@
+// IMPORTANTE: troque a linha "package" abaixo pela MESMA linha package
+// que já existe no arquivo de exemplo do template. Mantenha também o nome da classe.
 package com.github.yournamehere
 
 import android.content.Context
-import com.aliucord.Utils
+import android.media.AudioAttributes
+import android.media.AudioManager
+import android.media.AudioTrack
+import android.os.Environment
 import com.aliucord.annotations.AliucordPlugin
-import com.aliucord.api.CommandsAPI
-import com.aliucord.entities.MessageEmbedBuilder
 import com.aliucord.entities.Plugin
-import com.aliucord.patcher.*
-import com.aliucord.wrappers.embeds.MessageEmbedWrapper.Companion.title
-import com.discord.api.commands.ApplicationCommandType
-import com.discord.models.user.CoreUser
-import com.discord.stores.StoreUserTyping
-import com.discord.widgets.chat.list.adapter.WidgetChatListAdapterItemMessage
-import com.discord.widgets.chat.list.entries.ChatListEntry
-import com.discord.widgets.chat.list.entries.MessageEntry
+import com.aliucord.patcher.before
+import java.io.File
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 
-// Aliucord Plugin annotation. Must be present on the main class of your plugin
-// Plugin class. Must extend Plugin and override start and stop
-// Learn more: https://github.com/Aliucord/documentation/blob/main/plugin-dev/1_introduction.md#basic-plugin-structure
-@AliucordPlugin(
-    requiresRestart = false, // Whether your plugin requires a restart after being installed/updated
-)
-@Suppress("unused")
+/**
+ * Plugin de DIAGNÓSTICO: não altera nada, só registra em
+ * /storage/emulated/0/Aliucord/audio_diag.txt as chamadas de áudio
+ * que o Discord faz (modo de áudio, uso do stream, viva-voz, Bluetooth),
+ * junto com quem chamou (stack trace).
+ */
+@AliucordPlugin
 class MyFirstKotlinPlugin : Plugin() {
+
+    private val logFile by lazy {
+        File(Environment.getExternalStorageDirectory(), "Aliucord/audio_diag.txt")
+    }
+    private val fmt = SimpleDateFormat("HH:mm:ss.SSS", Locale.US)
+
+    private fun log(msg: String) {
+        try {
+            val trace = Throwable().stackTrace
+                .filter {
+                    !it.className.startsWith("com.aliucord") &&
+                        !it.className.startsWith("top.canyie") &&
+                        !it.className.startsWith("de.robv") &&
+                        !it.className.startsWith("java.lang.Throwable")
+                }
+                .take(12)
+                .joinToString("\n") { "    at ${it.className}.${it.methodName}(${it.fileName}:${it.lineNumber})" }
+            logFile.appendText("[${fmt.format(Date())}] $msg\n$trace\n\n")
+        } catch (e: Throwable) {
+            // ignora erros de escrita para nunca derrubar o app
+        }
+    }
+
     override fun start(context: Context) {
-        // Register a command with the name hello and description "My first command!" and no arguments.
-        // Learn more: https://github.com/Aliucord/documentation/blob/main/plugin-dev/2_commands.md
-        commands.registerCommand("hello", "My first command!") {
-            // Just return a command result with hello world as the content
-            CommandsAPI.CommandResult(
-                "Hello World!",
-                null, // List of embeds
-                false, // Whether to send visible for everyone
-            )
+        try {
+            logFile.parentFile?.mkdirs()
+        } catch (e: Throwable) {
+        }
+        log("=== AudioDiag iniciado ===")
+
+        // Modo de áudio: 0 = NORMAL (mídia), 3 = IN_COMMUNICATION (chamada)
+        patcher.before<AudioManager>("setMode", Int::class.java) { param ->
+            log("AudioManager.setMode(${param.args[0]})  [0=NORMAL, 3=IN_COMMUNICATION]")
         }
 
-        // A bit more advanced command with arguments
-        commands.registerCommand(
-            "hellowitharguments",
-            "Hello World but with arguments!",
-            listOf(
-                Utils.createCommandOption(
-                    ApplicationCommandType.STRING,
-                    "name",
-                    "Person to say hello to",
-                ),
-                Utils.createCommandOption(
-                    ApplicationCommandType.USER,
-                    "user",
-                    "User to say hello to",
-                ),
-            ),
-        ) { ctx ->
-            // Check if a user argument was passed
-            val username = if (ctx.containsArg("user")) {
-                ctx.getRequiredUser("user").username
-            } else {
-                // Returns either the argument value if present, or the defaultValue ("World" in this case)
-                ctx.getStringOrDefault("name", "World")
-            }
-
-            // Return the final result that will be displayed in chat as a response to the command
-            CommandsAPI.CommandResult("Hello $username!")
+        patcher.before<AudioManager>("setSpeakerphoneOn", Boolean::class.java) { param ->
+            log("AudioManager.setSpeakerphoneOn(${param.args[0]})")
         }
 
-        // Patch that adds an embed with message statistics to each message
-        // Patched method is WidgetChatListAdapterItemMessage.onConfigure(int type, ChatListEntry entry)
-        patcher.after<WidgetChatListAdapterItemMessage>(
-            "onConfigure", // Method name
-            // Refer to https://kotlinlang.org/docs/reflection.html#class-references
-            // and https://docs.oracle.com/javase/tutorial/reflect/class/classNew.html
-            Int::class.java, // int type
-            ChatListEntry::class.java, // ChatListEntry entry
-        ) { param ->
-            // see https://api.xposed.info/reference/de/robv/android/xposed/XC_MethodHook.MethodHookParam.html
-            // Obtain the second argument passed to the method, so the ChatListEntry
-            // Because this is a Message item, it will always be a MessageEntry, so cast it to that
-            val entry = param.args[1] as MessageEntry
-            val message = entry.message
-
-            // You need to be careful when messing with messages, because they may be loading
-            // (user sent a message, and it is currently sending)
-            if (message.isLoading) return@after
-
-            // Now add an embed with the statistics
-
-            // This method may be called multiple times per message, e.g. if it is edited,
-            // so first remove existing embeds
-            message.embeds.removeAll {
-                // MessageEmbed.getTitle() is actually obfuscated, but Aliucord provides extensions for commonly used
-                // obfuscated Discord classes, so just import the MessageEmbed.title extension and boom goodbye obfuscation!
-                it.title == "Message Statistics"
-            }
-
-            // Creating embeds is a pain, so Aliucord provides a convenient builder
-            MessageEmbedBuilder().run {
-                setTitle("Message Statistics")
-                addField("Length", "${message.content?.length ?: 0}", false)
-                addField("ID", message.id.toString(), false)
-
-                message.embeds.add(build())
-            }
+        patcher.before<AudioManager>("setBluetoothScoOn", Boolean::class.java) { param ->
+            log("AudioManager.setBluetoothScoOn(${param.args[0]})")
         }
 
-        // Patch that renames Juby to JoobJoob
-        patcher.before<CoreUser>("getUsername") { param ->
-            // see https://api.xposed.info/reference/de/robv/android/xposed/XC_MethodHook.MethodHookParam.html
-            // in before, after and instead patches, `this` refers to the instance of the class
-            // the patched method is on, so the CoreUser instance here
-            if (id == 925141667688878090) {
-                // setResult() in before patches skips original method invocation
-                param.result = "JoobJoob"
-            }
+        patcher.before<AudioManager>("startBluetoothSco") {
+            log("AudioManager.startBluetoothSco()")
         }
 
-        // Patch that hides your typing status by replacing the method and simply doing nothing
-        patcher.instead<StoreUserTyping>(
-            "setUserTyping",
-            Long::class.java, // java.lang.Long channelId
-        ) {
-            // Return null
-            null
+        // Uso do stream: 1 = MEDIA, 2 = VOICE_COMMUNICATION
+        patcher.before<AudioAttributes.Builder>("setUsage", Int::class.java) { param ->
+            log("AudioAttributes.Builder.setUsage(${param.args[0]})  [1=MEDIA, 2=VOICE_COMMUNICATION]")
+        }
+
+        patcher.before<AudioTrack.Builder>("setAudioAttributes", AudioAttributes::class.java) { param ->
+            val a = param.args[0] as? AudioAttributes
+            log("AudioTrack.Builder.setAudioAttributes(usage=${a?.usage}, contentType=${a?.contentType})")
         }
     }
 
     override fun stop(context: Context) {
-        // Remove all patches
         patcher.unpatchAll()
     }
 }
